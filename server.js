@@ -15,7 +15,7 @@ function buildProviders() {
       name: 'groq',
       base: (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, ''),
       key: process.env.GROQ_API_KEY,
-      model: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
+      model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b'
     });
   }
   if (process.env.OPENAI_API_KEY) {
@@ -31,17 +31,11 @@ function buildProviders() {
 
 const PROVIDERS = buildProviders();
 
-// Groq only accepts its own model ids. Map the UI's OpenAI-style names onto
-// real Groq models so the existing front-end keeps working untouched.
 const GROQ_MODELS = [
-  'llama-3.3-70b-versatile',
-  'llama-3.1-8b-instant',
   'openai/gpt-oss-120b',
   'openai/gpt-oss-20b',
-  'meta-llama/llama-4-scout-17b-16e-instruct',
-  'meta-llama/llama-4-maverick-17b-128e-instruct',
-  'qwen/qwen3-32b',
-  'moonshotai/kimi-k2-instruct'
+  'openai/gpt-oss-safeguard-20b',
+  'qwen/qwen3.8-27b'
 ];
 
 function pickModel(provider, requested) {
@@ -52,7 +46,19 @@ function pickModel(provider, requested) {
   return r || provider.model;
 }
 
-async function callProvider(provider, messages, requestedModel) {
+// Ordered models to try on one provider. If a model has been retired, we
+// quietly fall through to a known-good one instead of erroring the user.
+function modelCandidates(provider, requestedModel) {
+  const list = [pickModel(provider, requestedModel)];
+  if (provider.name === 'groq') {
+    for (const m of [provider.model, ...GROQ_MODELS]) {
+      if (!list.includes(m)) list.push(m);
+    }
+  }
+  return list;
+}
+
+async function callProvider(provider, messages, model) {
   const r = await fetch(provider.base + '/chat/completions', {
     method: 'POST',
     headers: {
@@ -63,7 +69,7 @@ async function callProvider(provider, messages, requestedModel) {
       'X-Title': 'Aleph AI'
     },
     body: JSON.stringify({
-      model: pickModel(provider, requestedModel),
+      model,
       messages: [{ role: 'system', content: SYS }, ...messages],
       temperature: 0.7
     })
@@ -96,25 +102,37 @@ app.post('/api/chat', async (req, res) => {
   let last = null;
 
   for (const provider of PROVIDERS) {
-    let result;
-    try {
-      result = await callProvider(provider, messages, req.body.model);
-    } catch (e) {
-      // Network/DNS failure — try the next provider.
-      last = { status: 502, data: { error: { message: 'Could not reach ' + provider.name + ': ' + e.message } } };
-      continue;
+    const candidates = modelCandidates(provider, req.body.model);
+
+    for (const model of candidates) {
+      let result;
+      try {
+        result = await callProvider(provider, messages, model);
+      } catch (e) {
+        // Network/DNS failure — move on to the next provider.
+        last = { status: 502, data: { error: { message: 'Could not reach ' + provider.name + ': ' + e.message } } };
+        break;
+      }
+
+      last = { status: result.status, data: result.data };
+      if (result.ok) return res.json(result.data);
+
+      // Retired / unknown model -> try the next candidate model.
+      const code = (result.data && result.data.error && (result.data.error.code || result.data.error.type)) || '';
+      const msg = (result.data && result.data.error && result.data.error.message) || '';
+      const modelMissing = result.status === 404 || code === 'model_not_found' ||
+        code === 'model_decommissioned' || (result.status === 400 && /model/i.test(msg));
+      if (modelMissing) continue;
+
+      // Rate-limited / provider-side error -> try the next provider.
+      // Any other 4xx is returned as-is: retrying won't fix a bad request.
+      const retryable = result.status === 429 || result.status >= 500;
+      if (!retryable) return res.status(result.status).json(result.data);
+      break;
     }
-
-    if (result.ok) return res.json(result.data);
-
-    // Rate-limited or provider-side error: fall back to the next provider.
-    // A 4xx (bad request) is returned immediately — retrying won't help.
-    last = { status: result.status, data: result.data };
-    const retryable = result.status === 429 || result.status >= 500;
-    if (!retryable) return res.status(result.status).json(result.data);
   }
 
-  res.status(last.status).json(last.data);
+  res.status(last ? last.status : 500).json(last ? last.data : { error: { message: 'All AI providers failed.' } });
 });
 
 app.get('/api/health', (req, res) => {
