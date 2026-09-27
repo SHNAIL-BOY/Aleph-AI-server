@@ -135,6 +135,36 @@ app.post('/api/chat', async (req, res) => {
   res.status(last ? last.status : 500).json(last ? last.data : { error: { message: 'All AI providers failed.' } });
 });
 
+// Speech-to-text fallback for browsers without live speech recognition.
+// The browser posts multipart/form-data; we forward it to the provider's
+// audio/transcriptions endpoint untouched (same boundary, same content type).
+const rawBody = express.raw({ type: () => true, limit: '25mb' });
+
+app.post('/api/transcribe', rawBody, async (req, res) => {
+  const provider = PROVIDERS.find((p) => p.name === 'groq') || PROVIDERS[0];
+  if (!provider) {
+    return res.status(500).json({ error: { message: 'Server has no API key set.' } });
+  }
+  if (!req.body || !req.body.length) {
+    return res.status(400).json({ error: { message: 'No audio received.' } });
+  }
+
+  try {
+    const r = await fetch(provider.base + '/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + provider.key,
+        'Content-Type': req.headers['content-type'] || 'multipart/form-data'
+      },
+      body: req.body
+    });
+    const text = await r.text();
+    res.status(r.status).type('application/json').send(text);
+  } catch (e) {
+    res.status(502).json({ error: { message: 'Transcription failed: ' + e.message } });
+  }
+});
+
 app.get('/api/health', (req, res) => {
   const primary = PROVIDERS[0];
   res.json({
